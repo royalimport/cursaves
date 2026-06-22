@@ -3,6 +3,8 @@
 import argparse
 import json
 import os
+import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -195,15 +197,24 @@ def cmd_workspaces(args):
 def _is_remote_path(path: str, source_machine: str) -> bool:
     """Check if a path looks like it came from an SSH remote session."""
     import platform
-    
+
     # If path doesn't exist locally, it's likely remote
     if not os.path.exists(path):
         return True
-    
+
+    system = platform.system()
+
     # On Mac, local paths start with /Users
-    if platform.system() == "Darwin" and not path.startswith("/Users"):
+    if system == "Darwin" and not path.startswith("/Users"):
         return True
-    
+
+    # On Windows, local paths use a drive letter (C:\ or C:/)
+    if system == "Windows":
+        if re.match(r"^[A-Za-z]:[/\\]", path):
+            return False
+        if path.startswith("/"):
+            return True
+
     return False
 
 
@@ -1684,6 +1695,14 @@ def cmd_migrate(args):
 
 
 def main():
+    if platform.system() == "Windows":
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                try:
+                    stream.reconfigure(encoding="utf-8")
+                except Exception:
+                    pass
+
     parser = argparse.ArgumentParser(
         prog="cursaves",
         description="Sync Cursor agent chat sessions between machines.",

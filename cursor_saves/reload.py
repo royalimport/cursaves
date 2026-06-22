@@ -22,6 +22,8 @@ def reload_cursor_window() -> bool:
         return _reload_macos()
     elif system == "Linux":
         return _reload_linux()
+    elif system == "Windows":
+        return _reload_windows()
     else:
         return False
 
@@ -115,6 +117,37 @@ def _reload_linux() -> bool:
         )
 
         return True
+
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _reload_windows() -> bool:
+    """Use PowerShell SendKeys to trigger Developer: Reload Window."""
+    try:
+        from .importer import is_cursor_running
+        if not is_cursor_running():
+            print("  Cursor is not running, skipping reload.", file=sys.stderr)
+            return False
+
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$wshell = New-Object -ComObject WScript.Shell; "
+            "if (-not $wshell.AppActivate('Cursor')) { exit 1 }; "
+            "Start-Sleep -Milliseconds 300; "
+            "[System.Windows.Forms.SendKeys]::SendWait('^+p'); "
+            "Start-Sleep -Milliseconds 400; "
+            "[System.Windows.Forms.SendKeys]::SendWait('Developer: Reload Window'); "
+            "Start-Sleep -Milliseconds 300; "
+            "[System.Windows.Forms.SendKeys]::SendWait('{ENTER}')"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return result.returncode == 0
 
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False

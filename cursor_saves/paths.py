@@ -8,25 +8,34 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote, unquote, urlparse
 
 
 def get_cursor_user_dir() -> Path:
     """Return the Cursor User data directory for the current platform.
 
-    macOS:  ~/Library/Application Support/Cursor/User
-    Linux:  ~/.config/Cursor/User
+    macOS:   ~/Library/Application Support/Cursor/User
+    Linux:   ~/.config/Cursor/User
+    Windows: %APPDATA%/Cursor/User
     """
     system = platform.system()
     if system == "Darwin":
         base = Path.home() / "Library" / "Application Support" / "Cursor" / "User"
     elif system == "Linux":
         base = Path.home() / ".config" / "Cursor" / "User"
+    elif system == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            base = Path(appdata) / "Cursor" / "User"
+        else:
+            base = Path.home() / "AppData" / "Roaming" / "Cursor" / "User"
     else:
         print(
             f"Error: Unsupported platform '{system}'.\n"
-            f"cursaves supports macOS and Linux.\n"
+            f"cursaves supports macOS, Linux, and Windows.\n"
             f"On macOS, Cursor data is at ~/Library/Application Support/Cursor/User/\n"
-            f"On Linux, Cursor data is at ~/.config/Cursor/User/",
+            f"On Linux, Cursor data is at ~/.config/Cursor/User/\n"
+            f"On Windows, Cursor data is at %APPDATA%/Cursor/User/",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -62,13 +71,53 @@ def get_cursor_projects_dir() -> Path:
     return Path.home() / ".cursor" / "projects"
 
 
+def uri_to_path(uri: str) -> str:
+    """Convert a file:// URI to a local filesystem path."""
+    if not uri.startswith("file://"):
+        return uri
+
+    parsed = urlparse(uri)
+    path = unquote(parsed.path)
+
+    # Windows: file:///c:/Users/... -> c:\Users\...
+    if platform.system() == "Windows":
+        if path.startswith("/") and len(path) >= 3 and path[2] == ":":
+            path = path[1:]
+        path = path.replace("/", "\\")
+
+    return os.path.normpath(path)
+
+
+def path_to_file_uri(path: str) -> str:
+    """Convert a local filesystem path to a Cursor-style file:// URI."""
+    path = os.path.normpath(os.path.expanduser(path))
+    path = path.replace("\\", "/")
+    if platform.system() == "Windows" and len(path) >= 2 and path[1] == ":":
+        path = path[0].lower() + path[2:]
+        return "file:///" + quote(path, safe="/")
+    return "file://" + quote(path, safe="/")
+
+
+def paths_equal(a: str, b: str) -> bool:
+    """Compare two filesystem paths, case-insensitively on Windows."""
+    left = os.path.normpath(a)
+    right = os.path.normpath(b)
+    if platform.system() == "Windows":
+        return os.path.normcase(left) == os.path.normcase(right)
+    return left == right
+
+
 def sanitize_project_path(project_path: str) -> str:
     """Convert a project path to Cursor's sanitized directory name format.
 
     /Users/callum/Desktop/Projects/myrepo -> Users-callum-Desktop-Projects-myrepo
+    C:\\Users\\Admin\\Cursor\\Psalter -> c-Users-Admin-Cursor-Psalter
     """
-    # Strip leading slash and replace / with -
-    return project_path.strip("/").replace("/", "-")
+    path = os.path.normpath(os.path.expanduser(project_path))
+    if platform.system() == "Windows" and len(path) >= 2 and path[1] == ":":
+        path = path[0].lower() + path[2:]
+    path = path.replace("\\", "/")
+    return path.strip("/").replace("/", "-")
 
 
 def _decode_ssh_host(host: str) -> str:
@@ -111,12 +160,10 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             continue
         try:
             data = json.loads(ws_json.read_text())
-            folder_uri = data.get("folder", "")
+            folder_uri = data.get("folder", data.get("workspace", ""))
             # Handle file:// URIs
             if folder_uri.startswith("file://"):
-                folder_path = folder_uri[len("file://") :]
-                # URL-decode common escapes
-                folder_path = folder_path.replace("%20", " ")
+                folder_path = uri_to_path(folder_uri)
             elif folder_uri.startswith("vscode-remote://"):
                 # SSH remote workspace - extract the path portion
                 # Format: vscode-remote://ssh-remote%2B<host>/<path>
@@ -128,7 +175,7 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             else:
                 continue
 
-            if os.path.normpath(folder_path) == target:
+            if paths_equal(folder_path, target):
                 matches.append(ws_dir)
         except (json.JSONDecodeError, OSError):
             continue
@@ -192,8 +239,7 @@ def list_all_workspaces() -> list[dict]:
                 ws_uri = data["workspace"]
                 if ws_uri.startswith("file://"):
                     folder_uri = ws_uri
-                    folder_path = ws_uri[len("file://") :]
-                    folder_path = folder_path.replace("%20", " ")
+                    folder_path = uri_to_path(ws_uri)
                     ws_type = "workspace"
                 else:
                     continue
@@ -203,8 +249,7 @@ def list_all_workspaces() -> list[dict]:
                     continue
 
                 if folder_uri.startswith("file://"):
-                    folder_path = folder_uri[len("file://") :]
-                    folder_path = folder_path.replace("%20", " ")
+                    folder_path = uri_to_path(folder_uri)
                 elif folder_uri.startswith("vscode-remote://"):
                     ws_type = "ssh"
                     # Format: vscode-remote://ssh-remote%2B<host>/<path>

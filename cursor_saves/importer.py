@@ -3,6 +3,8 @@
 import gzip
 import json
 import os
+import platform
+import re
 import subprocess
 import sys
 import uuid
@@ -102,29 +104,55 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
 
 
 def is_cursor_running() -> bool:
-    """Check if the main Cursor app process is running.
-
-    On macOS, pgrep -x fails because the comm field is truncated to 16
-    characters. Instead we parse `ps -axo args` and look for the main
-    Cursor executable while excluding helpers, crash handlers, and the
-    macOS CursorUIViewService system process.
-    """
+    """Check if the main Cursor app process is running."""
+    system = platform.system()
     try:
-        result = subprocess.run(
-            ["ps", "-axo", "args"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return False
-        for line in result.stdout.splitlines():
-            if "Cursor.app/Contents/MacOS/Cursor" in line \
-                    and "Helper" not in line \
-                    and "Frameworks" not in line:
-                return True
-        return False
+        if system == "Windows":
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq Cursor.exe", "/NH"],
+                capture_output=True,
+                text=True,
+            )
+            return result.returncode == 0 and "Cursor.exe" in result.stdout
+        if system == "Darwin":
+            return _is_cursor_running_macos()
+        if system == "Linux":
+            return _is_cursor_running_linux()
     except FileNotFoundError:
         return False
+    return False
+
+
+def _is_cursor_running_macos() -> bool:
+    """macOS: parse ps output for the main Cursor executable."""
+    result = subprocess.run(
+        ["ps", "-axo", "args"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        if "Cursor.app/Contents/MacOS/Cursor" in line \
+                and "Helper" not in line \
+                and "Frameworks" not in line:
+            return True
+    return False
+
+
+def _is_cursor_running_linux() -> bool:
+    """Linux: look for the Cursor process in ps output."""
+    result = subprocess.run(
+        ["ps", "-axo", "args"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        if re.search(r"\bCursor\b", line) and "Helper" not in line:
+            return True
+    return False
 
 
 _SKIP_REWRITE_KEYS = frozenset({"conversationState"})
@@ -170,7 +198,7 @@ def find_or_create_workspace(project_path: str) -> Path:
     ws_dir.mkdir(parents=True, exist_ok=True)
 
     # Create workspace.json
-    folder_uri = "file://" + os.path.normpath(project_path)
+    folder_uri = paths.path_to_file_uri(project_path)
     ws_json = ws_dir / "workspace.json"
     ws_json.write_text(json.dumps({"folder": folder_uri}))
 
@@ -828,9 +856,9 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
 
     uri_obj: dict = {"$mid": 1}
     if folder_uri.startswith("file://"):
-        fs_path = folder_uri[len("file://"):].replace("%20", " ")
+        fs_path = paths.uri_to_path(folder_uri)
         uri_obj["fsPath"] = fs_path
-        uri_obj["path"] = fs_path
+        uri_obj["path"] = fs_path.replace("\\", "/") if platform.system() == "Windows" else fs_path
         uri_obj["external"] = folder_uri
         uri_obj["scheme"] = "file"
     elif folder_uri.startswith("vscode-remote://"):
