@@ -115,7 +115,9 @@ cadfb263-3326-4aff-8887-dcc12f736b11     Feedback on documentation...   agent   
 
 ## Installation
 
-**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), macOS or Linux, Git (for git backend). Zero required Python dependencies.
+See **[INSTALL.md](INSTALL.md)** for install and reinstall instructions (Royal Import fork, including Windows).
+
+**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), macOS, Linux, or Windows, Git (for git backend). Zero required Python dependencies.
 
 **Tested with:** Cursor 2.6–3.0 (supports both old and new chat storage formats)
 
