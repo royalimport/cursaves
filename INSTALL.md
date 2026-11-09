@@ -84,6 +84,18 @@ cursaves pull -w royalimportodoo
 
 Avoid `-g` unless you intend to sync **all** workspaces on the machine.
 
+## Hands-off background sync (Windows)
+
+After `init`, on each machine:
+
+```bash
+cursaves autosync install
+```
+
+This runs a hidden sync at logon and every 15 minutes, and adds a **Cursor (synced)** Start Menu shortcut. Imports only happen while Cursor is closed. See the README's `autosync` section for details; check it with `cursaves autosync status`.
+
+After upgrading cursaves, re-run `cursaves autosync install` so the task points at the current install.
+
 ## Install from a local clone (development)
 
 ```bash

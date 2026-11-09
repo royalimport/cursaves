@@ -119,7 +119,7 @@ See **[INSTALL.md](INSTALL.md)** for install and reinstall instructions (Royal I
 
 **Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), macOS, Linux, or Windows, Git (for git backend). Zero required Python dependencies.
 
-**Tested with:** Cursor 2.6–3.0 (supports both old and new chat storage formats)
+**Tested with:** Cursor 2.6–3.29 (supports the inline `fullConversationHeadersOnly` format and the chunked `composerConvHeaders` format used by newer 3.x builds)
 
 ### Install as a global CLI tool (recommended)
 
@@ -216,12 +216,35 @@ All commands default to the current working directory as the project path. Use `
 | `checkpoint`   | Export all conversations (no push)                         | No                    |
 | `import --all` | Import snapshots (no pull)                                 | Yes                   |
 | `watch`        | Auto-checkpoint and sync in the background                 | No (reads only)       |
+| `autosync`     | Install/remove a hidden scheduled sync (Windows)           | Yes (when Cursor is closed) |
 | `copy`         | Copy conversations between workspaces (same machine)       | Yes                   |
 | `doctor`       | Audit chats: find orphaned/lost conversations, recover them | Yes (with `--recover`) |
 | `migrate`      | Migrate old chats to Cursor 3.0 global index                | Yes                   |
 | `purge`        | Delete chats from Cursor's DB to reclaim disk space          | Yes                   |
 
 Most of the time you only need `sync`. Use `push -s` when you want to push specific conversations. Use `repair` if you get "Blob not found" errors after importing. Use `doctor` to find and recover orphaned chats. Use `migrate` after updating to Cursor 3.0 to make all old chats visible in the sidebar. Use `purge` to delete chats and reclaim disk space (requires Cursor to be closed). Use `delete` to clean up snapshots you no longer need.
+
+### Hands-off sync on Windows with `autosync`
+
+```bash
+cursaves autosync install          # once per machine (no admin needed)
+cursaves autosync status           # task state + recent log
+cursaves autosync uninstall
+```
+
+`install` creates a Scheduled Task (`cursaves autosync`) that runs at logon and every 15 minutes (`--interval` to change) inside a headless console, so neither cursaves nor git ever shows a window. Each run executes:
+
+```bash
+cursaves sync --background --include-new --max-age-days 30
+```
+
+- **Push** — every chat that changed or was never pushed (`--include-new`).
+- **Pull** — skipped while Cursor is running (Cursor would discard the imports on exit). Chats already on this machine are updated; chats new to this machine are only imported if exported in the last 30 days (`--max-age-days`), so purged history doesn't come back.
+- **Log** — `~/.config/cursaves/autosync.log` (rotates at 1 MB). Git never prompts; auth failures are logged instead.
+
+It also adds a **Cursor (synced)** Start Menu shortcut that syncs first (while Cursor is still closed) and then opens Cursor — use it to always start with the other machine's latest chats.
+
+Git auth must work without a prompt: an SSH key without a passphrase (or loaded in ssh-agent), or HTTPS via Git Credential Manager with saved credentials.
 
 ### Auto-sync with `watch`
 
@@ -281,8 +304,8 @@ Note: "Developer: Reload Window" is not sufficient -- it reloads the renderer bu
 
 ## Safety
 
-- **Read operations** (`list`, `export`, `checkpoint`, `status`, `watch`) work on a temporary copy of the database. They never touch Cursor's files and are safe to run while Cursor is open.
-- **Write operations** (`import`, `pull`) back up the target database before writing, and refuse to run while Cursor is detected as running. Use `--force` to override (not recommended).
+- **Read operations** (`list`, `export`, `checkpoint`, `status`, `watch`) open the database read-only (falling back to a temporary copy). They never modify Cursor's files and are safe to run while Cursor is open.
+- **Write operations** (`import`, `pull`, `sync`) back up the target database before writing, and refuse to import while Cursor is detected as running. Use `--force` to override (not recommended).
 - Snapshots are self-contained JSON -- even if import goes wrong, you always have the raw data and the backup.
 
 ## Privacy Warning

@@ -317,7 +317,19 @@ A conversation with 1000 messages will have 1000 separate `bubbleId:` entries in
 - **Legacy (v1/v2):** `conversationMap` in `composerData` is populated with message content
 - **Current (v3):** `conversationMap` is empty or absent; messages are in `bubbleId:` entries
 
-Both formats use `fullConversationHeadersOnly` as the ordered message index.
+Both formats use `fullConversationHeadersOnly` as the ordered message index — until the chunked header format below.
+
+## Chunked Message Headers (Cursor 3.x, observed in 3.29)
+
+Newer builds leave `fullConversationHeadersOnly` empty and store the ordered message index in chunks:
+
+- **Keys:** `composerConvHeaders:{composerId}:{000000}`, `…:000001`, … in `cursorDiskKV`
+- **Value:** a JSON array of up to 256 headers, same shape as the old array entries (`bubbleId`, `type`, `grouping`, `createdAt`, …). Sub-steps of an assistant turn use bubble IDs like `{bubbleId}/s:0`.
+- **Summary in `composerData.headerLog`:** `{"chunkSize": 256, "chunkCount": N, "count": <total headers>, "generation": "<uuid>"}`
+
+A chat exported without these chunks imports as an empty conversation. cursaves snapshots from version 4 onwards carry them in `convHeaderChunks`, and message counts use `headerLog.count` when the inline array is empty.
+
+Also new in this format: `ofsContent:{composerId}:{fileUri}` (original file contents for undoing agent edits) and `composerRootWriterDiagnostic:{composerId}`. cursaves does not sync these; chats continue fine without them, but "undo all" on agent edits from the other machine isn't available.
 
 ## Checkpoint Data
 

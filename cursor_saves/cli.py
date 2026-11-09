@@ -7,6 +7,7 @@ import platform
 import re
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,7 @@ from .importer import (
     import_all_snapshots,
     import_from_snapshot_dir,
     import_snapshot,
+    is_cursor_running,
     list_snapshot_projects,
     list_snapshot_files,
     read_snapshot_file,
@@ -403,10 +405,8 @@ def cmd_export(args):
     print(f"Saved to {saved_path}")
 
     # Show summary
-    data = snapshot["composerData"]
-    headers = data.get("fullConversationHeadersOnly", [])
     blobs = snapshot.get("contentBlobs", {})
-    print(f"  Messages: {len(headers)}")
+    print(f"  Messages: {db.message_count(snapshot['composerData'])}")
     print(f"  Content blobs: {len(blobs)}")
     print(f"  Source: {snapshot['sourceMachine']}")
 
@@ -622,10 +622,14 @@ def _select_conversations(project_path: str, prompt: str = "push", workspace_dir
     return tui_select_conversations(conversations, action=prompt)
 
 
-def _find_ahead_conversations() -> list[dict]:
-    """Scan all workspaces for conversations that are ahead of their snapshots."""
+def _find_ahead_conversations(include_new: bool = False) -> list[dict]:
+    """Scan all workspaces for conversations that are ahead of their snapshots.
+
+    With include_new, also returns non-empty conversations that were never pushed.
+    """
     workspaces = paths.list_workspaces_with_conversations()
     ahead_items: list[dict] = []
+    wanted = {"local_ahead", "never_pushed"} if include_new else {"local_ahead"}
 
     global_db_path = paths.get_global_db_path()
     if not global_db_path.exists():
@@ -646,9 +650,11 @@ def _find_ahead_conversations() -> list[dict]:
 
             for cid in composer_ids:
                 status = get_push_status_for_conversation(cid, project_id, _cdb=global_cdb)
-                if status == "local_ahead":
+                if status in wanted:
                     # Get chat name from global DB
                     cd = global_cdb.get_json(f"composerData:{cid}")
+                    if status == "never_pushed" and not db.message_count(cd):
+                        continue
                     name = cd.get("name", "Untitled") if cd else "Untitled"
 
                     ws_name = os.path.basename(os.path.normpath(ws["path"])) or ws["path"]
@@ -708,13 +714,19 @@ def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBa
     return total_saved
 
 
-def _push_ahead(sync_dir: Path, auto: bool = False, backend: Optional[SyncBackend] = None) -> int:
+def _push_ahead(
+    sync_dir: Path,
+    auto: bool = False,
+    backend: Optional[SyncBackend] = None,
+    include_new: bool = False,
+) -> int:
     """Find conversations ahead of snapshots and push them.
 
     Args:
         sync_dir: The sync repo directory.
         auto: If True, skip prompts and push all ahead conversations.
         backend: Sync backend to use for push. Auto-detected if None.
+        include_new: Also push conversations that have never been pushed.
 
     Returns the number of conversations pushed.
     """
@@ -730,7 +742,7 @@ def _push_ahead(sync_dir: Path, auto: bool = False, backend: Optional[SyncBacken
             else:
                 print(" failed (continuing with local state)", file=sys.stderr)
 
-    ahead_items = _find_ahead_conversations()
+    ahead_items = _find_ahead_conversations(include_new=include_new)
 
     if not ahead_items:
         if not auto:
@@ -810,18 +822,35 @@ def _save_sync_state(state: dict):
     state_path.write_text(json.dumps(state, indent=2))
 
 
-def _pull_behind(sync_dir: Path) -> int:
+def _exported_after(meta: dict, cutoff: datetime) -> bool:
+    try:
+        exported = datetime.fromisoformat(meta.get("exportedAt") or "")
+    except ValueError:
+        return False
+    if exported.tzinfo is None:
+        exported = exported.replace(tzinfo=timezone.utc)
+    return exported >= cutoff
+
+
+def _pull_behind(sync_dir: Path, max_age_days: Optional[int] = None) -> int:
     """Find all snapshots where local is behind and import them automatically.
 
     For each behind/new snapshot, finds workspaces that already have the
     conversation registered and imports only into those.  This prevents
     duplicating imports across every matching workspace.
 
+    With max_age_days, chats not yet on this machine are only imported if
+    their snapshot was exported within that many days.
+
     Returns the number of snapshots successfully imported.
     """
     projects = list_snapshot_projects()
     if not projects:
         return 0
+
+    cutoff = None
+    if max_age_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
 
     global_db_path = paths.get_global_db_path()
     global_cdb = db.CursorDB(global_db_path) if global_db_path.exists() else None
@@ -853,6 +882,8 @@ def _pull_behind(sync_dir: Path) -> int:
                     continue
 
                 status = get_sync_status_for_snapshot(cid, msg_count, _cdb=global_cdb)
+                if status == "not_local" and cutoff and not _exported_after(meta, cutoff):
+                    continue
                 if status in ("behind", "not_local"):
                     behind_snapshots.append((sf, meta))
 
@@ -956,17 +987,26 @@ def cmd_sync(args):
             print(" failed", file=sys.stderr)
             return
 
-    # Step 2: Import — pull behind conversations from snapshots into Cursor DBs
+    # Step 2: Import — pull behind conversations from snapshots into Cursor DBs.
+    # Cursor rewrites the sidebar index on exit, so imports made while it's
+    # running would vanish.
     print("\n── Pull ──")
-    imported = _pull_behind(sync_dir)
-    if imported > 0:
-        print(f"  Imported {imported} conversation(s)")
+    if not getattr(args, "force", False) and is_cursor_running():
+        imported = 0
+        print("  Cursor is running — skipping import until it's closed")
     else:
-        print("  Everything up to date")
+        imported = _pull_behind(sync_dir, max_age_days=getattr(args, "max_age_days", None))
+        if imported > 0:
+            print(f"  Imported {imported} conversation(s)")
+        else:
+            print("  Everything up to date")
 
     # Step 3: Push — export ahead conversations from Cursor DBs into snapshots
     print("\n── Push ──")
-    pushed = _push_ahead(sync_dir, auto=True, backend=backend)
+    pushed = _push_ahead(
+        sync_dir, auto=True, backend=backend,
+        include_new=getattr(args, "include_new", False),
+    )
     if pushed == 0:
         print("  Nothing to push")
 
@@ -983,6 +1023,27 @@ def cmd_sync(args):
             print("Restart Cursor to see imported chats.")
     else:
         print("Already in sync.")
+
+
+def cmd_autosync(args):
+    """Manage the background sync task and synced Cursor launcher."""
+    from . import autosync
+
+    action = args.autosync_command
+    if action == "install":
+        code = autosync.install(args.interval, shortcut=not args.no_shortcut)
+    elif action == "uninstall":
+        code = autosync.uninstall()
+    elif action == "status":
+        code = autosync.status()
+    else:
+        sync_args = argparse.Namespace(
+            force=False, background=True, include_new=True,
+            max_age_days=autosync.MAX_AGE_DAYS,
+        )
+        code = autosync.launch(lambda: cmd_sync(sync_args))
+    if code:
+        sys.exit(code)
 
 
 def cmd_push(args):
@@ -1840,7 +1901,45 @@ def main():
     p_sync = subparsers.add_parser(
         "sync", help="Pull behind + push ahead — one command to stay in sync across machines"
     )
+    p_sync.add_argument(
+        "--force", action="store_true",
+        help="Import even if Cursor is running (imports may vanish when Cursor exits)",
+    )
+    p_sync.add_argument(
+        "--include-new", action="store_true",
+        help="Also push chats that have never been pushed (default: only already-synced chats)",
+    )
+    p_sync.add_argument(
+        "--max-age-days", type=int,
+        help="Only import chats not yet on this machine if exported within N days",
+    )
+    p_sync.add_argument(
+        "--background", action="store_true",
+        help="Log to ~/.config/cursaves/autosync.log and never prompt (for scheduled runs)",
+    )
     p_sync.set_defaults(func=cmd_sync)
+
+    # ── autosync ───────────────────────────────────────────────────
+    p_autosync = subparsers.add_parser(
+        "autosync", help="Install/remove hands-off background sync (Windows Scheduled Task)"
+    )
+    autosync_sub = p_autosync.add_subparsers(dest="autosync_command", required=True)
+    p_as_install = autosync_sub.add_parser(
+        "install", help="Schedule a background sync at logon and every N minutes"
+        " (re-run to update)"
+    )
+    p_as_install.add_argument(
+        "--interval", "-i", type=int, default=15,
+        help="Minutes between runs (default: 15)",
+    )
+    p_as_install.add_argument(
+        "--no-shortcut", action="store_true",
+        help="Don't create the 'Cursor (synced)' Start Menu shortcut",
+    )
+    autosync_sub.add_parser("uninstall", help="Remove the scheduled task and shortcut")
+    autosync_sub.add_parser("status", help="Show task state and recent log output")
+    autosync_sub.add_parser("launch", help="Sync (if Cursor is closed), then open Cursor")
+    p_autosync.set_defaults(func=cmd_autosync)
 
     # ── repair ─────────────────────────────────────────────────────
     p_repair = subparsers.add_parser(
@@ -1965,6 +2064,9 @@ def main():
             "  push -s               Select workspace + chats to push\n"
             "  pull                  Pull + import chats\n"
             "  pull -s               Select which snapshots to import\n"
+            "  sync                  Pull behind + push ahead (all workspaces)\n"
+            "  autosync install      Run sync in the background (Windows)\n"
+            "  autosync status       Show background sync state + log\n"
             "\n"
             "─── Copy between workspaces (same machine) ─────────────────────\n"
             "\n"
@@ -1999,7 +2101,19 @@ def main():
         )
         sys.exit(1)
 
-    args.func(args)
+    if not getattr(args, "background", False):
+        args.func(args)
+        return
+
+    from . import autosync
+    import traceback
+
+    autosync.setup_background_logging(" ".join(sys.argv[1:]))
+    try:
+        args.func(args)
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -7,13 +7,28 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+# Cursor 3.x moved message headers out of composerData.fullConversationHeadersOnly
+# into chunked keys "composerConvHeaders:{composerId}:{000000}", summarised by
+# composerData.headerLog.
+CONV_HEADERS_PREFIX = "composerConvHeaders:"
+
+
+def message_count(composer_data: Optional[dict]) -> int:
+    """Number of messages in a conversation, in either storage format."""
+    if not composer_data:
+        return 0
+    headers = composer_data.get("fullConversationHeadersOnly") or []
+    if headers:
+        return len(headers)
+    return (composer_data.get("headerLog") or {}).get("count", 0)
+
 
 class CursorDB:
     """Safe interface to a Cursor state.vscdb database.
 
-    All reads are performed on a temporary copy of the database to avoid
-    locking conflicts with a running Cursor instance. Writes operate on
-    the original file and require Cursor to be closed.
+    Reads use a read-only connection (or a temporary copy if that fails),
+    so they are safe while Cursor is running. Writes operate on the
+    original file and require Cursor to be closed.
     """
 
     def __init__(self, db_path: Path):
@@ -22,12 +37,25 @@ class CursorDB:
         self._conn: Optional[sqlite3.Connection] = None
 
     def _ensure_read_copy(self) -> sqlite3.Connection:
-        """Copy the database to a temp file and open a read-only connection."""
+        """Open a read-only connection, falling back to a temp copy.
+
+        Cursor's DBs use WAL mode, so a read-only reader sees committed data
+        without blocking Cursor. The global DB can be many GB, so copying it
+        on every read is far too expensive for scheduled syncs.
+        """
         if self._conn is not None:
             return self._conn
 
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {self.db_path}")
+
+        try:
+            conn = sqlite3.connect(f"{self.db_path.as_uri()}?mode=ro", uri=True)
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+            self._conn = conn
+            return conn
+        except sqlite3.Error:
+            pass
 
         # Copy the main db file and any WAL/SHM files
         tmp_dir = tempfile.mkdtemp(prefix="cursaves-")
@@ -156,6 +184,28 @@ class CursorDB:
             return json.loads(raw)
         except json.JSONDecodeError:
             return None
+
+    def get_conv_header_chunks(self, composer_id: str) -> dict[str, list]:
+        """Chunked message headers (Cursor 3.x), keyed by chunk number."""
+        prefix = f"{CONV_HEADERS_PREFIX}{composer_id}:"
+        chunks = {}
+        for key in self.list_keys(prefix):
+            val = self.get_json(key)
+            if isinstance(val, list):
+                chunks[key[len(prefix):]] = val
+        return chunks
+
+    def get_conversation_headers(
+        self, composer_id: str, composer_data: Optional[dict] = None
+    ) -> list[dict]:
+        """Message headers for a conversation, in either storage format."""
+        if composer_data is None:
+            composer_data = self.get_json(f"composerData:{composer_id}") or {}
+        headers = composer_data.get("fullConversationHeadersOnly") or []
+        if headers or not composer_data.get("headerLog"):
+            return headers
+        chunks = self.get_conv_header_chunks(composer_id)
+        return [h for chunk in sorted(chunks) for h in chunks[chunk]]
 
     # ── Write operations (on original file) ─────────────────────────
 
