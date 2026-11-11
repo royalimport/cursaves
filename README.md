@@ -439,6 +439,8 @@ Bump the version in **both** files:
 
 Use [semver](https://semver.org/): patch for fixes, minor for features, major for breaking changes.
 
+Run the tests with `uv run pytest`.
+
 ## Support
 
 If you find this useful, consider buying me a coffee:
