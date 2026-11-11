@@ -35,6 +35,7 @@ class CursorDB:
         self.db_path = db_path
         self._tmp_path: Optional[Path] = None
         self._conn: Optional[sqlite3.Connection] = None
+        self._agent_blob_ids: Optional[set[bytes]] = None
 
     def _ensure_read_copy(self) -> sqlite3.Connection:
         """Open a read-only connection, falling back to a temp copy.
@@ -146,6 +147,19 @@ class CursorDB:
             return [r[0] for r in rows]
         except sqlite3.OperationalError:
             return []
+
+    def agent_blob_ids(self) -> set[bytes]:
+        """Return the raw 32-byte IDs of every agentKv blob (cached per instance)."""
+        if self._agent_blob_ids is None:
+            prefix = "agentKv:blob:"
+            ids = set()
+            for key in self.list_keys(prefix):
+                try:
+                    ids.add(bytes.fromhex(key[len(prefix):]))
+                except ValueError:
+                    continue
+            self._agent_blob_ids = ids
+        return self._agent_blob_ids
 
     def count_keys_by_chat_prefix(
         self, key_type: str, table: str = "cursorDiskKV"

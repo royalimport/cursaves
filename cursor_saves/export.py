@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import db, paths
 
@@ -376,11 +376,60 @@ def _extract_agent_blob_ids(conv_data: dict) -> set[str]:
     return blob_ids
 
 
+def _child_blob_ids(data: bytes, known_ids: set[bytes]) -> set[str]:
+    """Find agentKv blob IDs referenced from inside another blob.
+
+    Agent blobs form a tree: a blob is often a protobuf whose 32-byte
+    length-delimited fields (possibly inside nested messages) are the IDs
+    of further blobs. Every such field is encoded as a 0x20 length byte
+    followed by the 32 ID bytes, so we check the 32 bytes after each 0x20
+    against the set of known blob IDs. Requiring a match against an
+    existing ID rules out false positives.
+    """
+    found: set[str] = set()
+    i = data.find(b"\x20")
+    while i != -1 and i + 33 <= len(data):
+        candidate = data[i + 1 : i + 33]
+        if candidate in known_ids:
+            found.add(candidate.hex())
+        i = data.find(b"\x20", i + 1)
+    return found
+
+
+def collect_blob_closure(
+    root_ids: set[str],
+    get_blob: "Callable[[str], Optional[bytes]]",
+    known_ids: set[bytes],
+) -> tuple[dict[str, bytes], set[str]]:
+    """Walk the agent blob tree from *root_ids*.
+
+    Returns (found, missing): every reachable blob that *get_blob* could
+    return, and the reachable IDs it couldn't. Children are only discovered
+    through blobs that were found, so missing descendants of a missing blob
+    are not reported.
+    """
+    found: dict[str, bytes] = {}
+    missing: set[str] = set()
+    stack = list(root_ids)
+    seen = set(root_ids)
+    while stack:
+        bid = stack.pop()
+        val = get_blob(bid)
+        if val is None:
+            missing.add(bid)
+            continue
+        found[bid] = val
+        for child in _child_blob_ids(val, known_ids) - seen:
+            seen.add(child)
+            stack.append(child)
+    return found, missing
+
+
 def _extract_agent_blobs(
     conv_data: dict,
     cdb: "db.CursorDB",
 ) -> dict[str, str]:
-    """Fetch agentKv blob entries referenced by a conversation.
+    """Fetch every agentKv blob a conversation needs, including nested ones.
 
     Returns a dict mapping hex blob IDs to their base64-encoded values.
     Values are stored as binary in the DB; we base64-encode them for JSON
@@ -388,17 +437,16 @@ def _extract_agent_blobs(
     """
     import base64
 
-    blob_ids = _extract_agent_blob_ids(conv_data)
-    if not blob_ids:
+    root_ids = _extract_agent_blob_ids(conv_data)
+    if not root_ids:
         return {}
 
-    blobs: dict[str, str] = {}
-    for bid in blob_ids:
-        key = f"agentKv:blob:{bid}"
-        val = cdb.get_item_binary(key, table="cursorDiskKV")
-        if val is not None:
-            blobs[bid] = base64.b64encode(val).decode("ascii")
-    return blobs
+    found, _ = collect_blob_closure(
+        root_ids,
+        lambda bid: cdb.get_item_binary(f"agentKv:blob:{bid}", table="cursorDiskKV"),
+        cdb.agent_blob_ids(),
+    )
+    return {bid: base64.b64encode(val).decode("ascii") for bid, val in found.items()}
 
 
 def export_conversation(
@@ -461,8 +509,9 @@ def export_conversation(
 
         # Agent state blobs (encrypted agent context needed for continuation).
         # The conversationState field in composerData is a protobuf containing
-        # references to agentKv:blob:{hex} entries. Without these, Cursor's
-        # agent loop fails with "Blob not found" when continuing the chat.
+        # references to agentKv:blob:{hex} entries, which reference further
+        # blobs. Without the whole tree, Cursor's agent loop fails with
+        # "Blob not found" when continuing the chat.
         agent_blobs = _extract_agent_blobs(conv_data, _cdb)
 
         snapshot = {
@@ -479,6 +528,7 @@ def export_conversation(
             "convHeaderChunks": _cdb.get_conv_header_chunks(composer_id),
             "checkpoints": checkpoints,
             "agentBlobs": agent_blobs,
+            "agentBlobTree": True,
             "transcript": get_transcript(project_path, composer_id),
             "messageContexts": contexts,
         }
@@ -580,6 +630,7 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "sourceProjectPath": snapshot.get("sourceProjectPath"),
         "projectIdentifier": snapshot.get("projectIdentifier"),
         "version": snapshot.get("version"),
+        "agentBlobTree": snapshot.get("agentBlobTree", False),
         "shardCount": num_shards if num_shards else None,
     }
     meta_file = project_dir / f"{composer_id}.meta.json"

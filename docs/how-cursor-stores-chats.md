@@ -367,6 +367,16 @@ User messages (type 1) reference checkpoints via their `checkpointId` field in t
 
 A long conversation can accumulate hundreds of checkpoints. They compress well (mostly text diffs) — a conversation with 189 checkpoints is roughly 9 MB uncompressed / 1.4 MB compressed.
 
+## Agent State Blobs
+
+**Location:** `globalStorage/state.vscdb`, `cursorDiskKV` table, keys matching `agentKv:blob:{hex}` (binary values)
+
+The agent's working state is stored as a tree of content-addressed blobs. `composerData.conversationState` is a `~`-prefixed base64 protobuf whose 32-byte length-delimited fields are the IDs of root blobs. Many blobs are themselves protobufs that reference further blobs the same way, sometimes inside nested messages, so the tree can be several levels deep.
+
+Continuing a chat needs **every** blob in the tree. Copying only the roots lets the chat render but fails with "Blob not found" as soon as the agent reads a deeper blob. In practice the full tree is roughly twice the size of the roots alone.
+
+cursaves exports the whole tree into `agentBlobs` and marks such snapshots with `"agentBlobTree": true`. A machine re-pushes its own older snapshots that lack the marker on the next `sync`, and `repair` restores missing blobs anywhere in the tree from snapshots.
+
 ## Message Request Contexts
 
 **Location:** `globalStorage/state.vscdb`, `cursorDiskKV` table, keys matching `messageRequestContext:{composerId}:{messageId}`

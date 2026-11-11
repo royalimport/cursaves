@@ -550,7 +550,9 @@ def get_push_status_for_conversation(
     Returns one of:
       "never_pushed"  - no snapshot exists for this conversation
       "up_to_date"    - snapshot matches local message count
-      "local_ahead"   - local has more messages than the snapshot
+      "local_ahead"   - local has more messages than the snapshot, or this
+                        machine pushed it before snapshots carried the full
+                        agent blob tree (so it needs re-exporting)
       "behind"        - snapshot has more messages (pushed from elsewhere)
     """
     snapshots_dir = paths.get_snapshots_dir()
@@ -581,12 +583,13 @@ def get_push_status_for_conversation(
 
     local_count = db.message_count(local_data)
 
-    if local_count == snapshot_count:
-        return "up_to_date"
-    elif local_count > snapshot_count:
+    if local_count > snapshot_count:
         return "local_ahead"
-    else:
+    if local_count < snapshot_count:
         return "behind"
+    if not meta.get("agentBlobTree") and meta.get("sourceMachine") == paths.get_machine_id():
+        return "local_ahead"
+    return "up_to_date"
 
 
 _SYNC_STATUS_LABELS = {
@@ -1118,7 +1121,7 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
     Returns (conversations_repaired, blobs_restored).
     """
     import base64
-    from .export import _extract_agent_blob_ids
+    from .export import _extract_agent_blob_ids, collect_blob_closure
 
     global_db_path = paths.get_global_db_path()
     if not global_db_path.exists():
@@ -1128,111 +1131,99 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
     if not snapshots_dir.exists():
         return 0, 0
 
-    # Phase 1: Find conversations with missing blobs
-    missing_map: dict[str, set[str]] = {}  # composerId -> set of missing blob hex IDs
-
     with db.CursorDB(global_db_path) as cdb:
-        all_keys = cdb.list_keys("composerData:")
-        for key in all_keys:
+        # Phase 1: Root blob IDs for every local conversation
+        roots_by_cid: dict[str, set[str]] = {}
+        for key in cdb.list_keys("composerData:"):
             cd = cdb.get_json(key)
             if not cd:
                 continue
             refs = _extract_agent_blob_ids(cd)
-            if not refs:
+            if refs:
+                roots_by_cid[key.split(":", 1)[1]] = refs
+
+        if not roots_by_cid:
+            if verbose:
+                print("  No conversations with agent blobs.")
+            return 0, 0
+
+        local_ids = cdb.agent_blob_ids()
+
+        # Phase 2: Collect blobs this machine lacks from snapshots of its
+        # conversations (agentBlobs exist from version 3 onwards).
+        snapshot_blobs: dict[str, bytes] = {}
+        for project_dir in snapshots_dir.iterdir():
+            if not project_dir.is_dir():
                 continue
+            for sf in list_snapshot_files(project_dir):
+                meta = read_snapshot_meta(sf)
+                if meta.get("composerId") not in roots_by_cid or meta.get("version", 1) < 3:
+                    continue
 
-            missing = set()
-            for bid in refs:
-                val = cdb.get_item_binary(f"agentKv:blob:{bid}", table="cursorDiskKV")
-                if val is None:
-                    missing.add(bid)
+                if verbose:
+                    print(f"  Scanning: {sf.name}")
 
-            if missing:
-                cid = key.split(":", 1)[1]
-                missing_map[cid] = missing
+                try:
+                    snap = read_snapshot_file(sf)
+                except Exception:
+                    continue
 
-    if not missing_map:
+                for bid, b64val in (snap.get("agentBlobs") or {}).items():
+                    if bid in snapshot_blobs:
+                        continue
+                    try:
+                        if bytes.fromhex(bid) in local_ids:
+                            continue
+                        snapshot_blobs[bid] = base64.b64decode(b64val)
+                    except ValueError:
+                        continue
+
+        # Phase 3: Walk each conversation's blob tree across local and
+        # snapshot blobs; anything reachable that only a snapshot has is restored.
+        known_ids = local_ids | {bytes.fromhex(bid) for bid in snapshot_blobs}
+
+        def get_blob(bid: str) -> Optional[bytes]:
+            if bid in snapshot_blobs:
+                return snapshot_blobs[bid]
+            return cdb.get_item_binary(f"agentKv:blob:{bid}", table="cursorDiskKV")
+
+        to_restore: set[str] = set()
+        unrecoverable: set[str] = set()
+        conversations_fixed = 0
+        for roots in roots_by_cid.values():
+            found, missing = collect_blob_closure(roots, get_blob, known_ids)
+            needed = found.keys() & snapshot_blobs.keys()
+            if needed:
+                conversations_fixed += 1
+                to_restore |= needed
+            unrecoverable |= missing
+
+    if not to_restore:
         if verbose:
-            print("  No conversations with missing blobs.")
+            if unrecoverable:
+                print(f"  No matching blobs found in snapshots ({len(unrecoverable)} still missing)")
+            else:
+                print("  No conversations with missing blobs.")
         return 0, 0
-
-    all_missing_ids = set()
-    for s in missing_map.values():
-        all_missing_ids |= s
 
     if verbose:
-        print(f"  {len(missing_map)} conversation(s) with {len(all_missing_ids)} unique missing blob(s)")
+        print(f"  {conversations_fixed} conversation(s) with {len(to_restore)} missing blob(s) found in snapshots")
 
-    # Phase 2: Scan snapshots that contain agentBlobs (version >= 3).
-    # Only decompress snapshots that might contain the missing blobs.
-    restored_blobs: dict[str, bytes] = {}
-
-    for project_dir in snapshots_dir.iterdir():
-        if not project_dir.is_dir():
-            continue
-        for sf in list_snapshot_files(project_dir):
-            if not all_missing_ids - set(restored_blobs.keys()):
-                break
-
-            meta = read_snapshot_meta(sf)
-            if meta.get("version", 1) < 3:
-                continue
-
-            if verbose:
-                print(f"  Scanning: {sf.name}")
-
-            try:
-                snap = read_snapshot_file(sf)
-            except Exception:
-                continue
-
-            snap_blobs = snap.get("agentBlobs", {})
-            if not snap_blobs:
-                continue
-
-            found_any = False
-            for bid, b64val in snap_blobs.items():
-                if bid in all_missing_ids and bid not in restored_blobs:
-                    try:
-                        restored_blobs[bid] = base64.b64decode(b64val)
-                        found_any = True
-                    except Exception:
-                        pass
-
-            if found_any and verbose:
-                count = sum(1 for b in snap_blobs if b in all_missing_ids)
-                print(f"    Found {count} matching blob(s)")
-
-        if not all_missing_ids - set(restored_blobs.keys()):
-            break
-
-    if not restored_blobs:
-        if verbose:
-            still_missing = len(all_missing_ids)
-            print(f"  No matching blobs found in snapshots ({still_missing} still missing)")
-        return 0, 0
-
-    # Phase 3: Write restored blobs to the global DB
+    # Phase 4: Write restored blobs to the global DB
     backup_path = db.backup_db(global_db_path)
     if verbose:
         print(f"  Backed up global DB to {backup_path.name}")
 
     with db.CursorDB(global_db_path) as cdb:
         cdb.write_batch([
-            (f"agentKv:blob:{bid}", val)
-            for bid, val in restored_blobs.items()
+            (f"agentKv:blob:{bid}", snapshot_blobs[bid])
+            for bid in to_restore
         ])
 
-    conversations_fixed = 0
-    for cid, missing in missing_map.items():
-        if missing & set(restored_blobs.keys()):
-            conversations_fixed += 1
+    if verbose and unrecoverable:
+        print(f"  {len(unrecoverable)} blob(s) not found in any snapshot (from conversations not yet pushed)")
 
-    remaining = len(all_missing_ids) - len(restored_blobs)
-    if verbose and remaining > 0:
-        print(f"  {remaining} blob(s) not found in any snapshot (from conversations not yet pushed)")
-
-    return conversations_fixed, len(restored_blobs)
+    return conversations_fixed, len(to_restore)
 
 
 # ── Doctor: audit and recover orphaned chats ─────────────────────────
